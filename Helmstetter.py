@@ -1,14 +1,18 @@
 #%%
-import matplotlib.pyplot as plt
-import numpy as np
-import csep
 from csep.core import poisson_evaluations as poisson
 from csep.utils import datasets, time_utils
 from csep import plots
+import csep
 
+from etas.inversion import triggering_kernel, parameter_dict2array, to_days, haversine
+import numpy as np
+from shapely.geometry import Point, Polygon
+import json
+import pandas as pd
+import datetime as dt
+import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from functions import *
 
@@ -20,7 +24,13 @@ forecast = csep.load_gridded_forecast(datasets.helmstetter_aftershock_fname,
                                       start_date=start_date,
                                       end_date=end_date,
                                       name='helmstetter_aftershock')
-
+with open("/home/daned/2024_NEHRP/etas_2/output_data/parameters_0.json", 'r') as f:
+    inversion_config = json.load(f)
+forecast_time = pd.Timestamp(inversion_config["timewindow_end"])
+from numpy import array
+polygon = Polygon(np.array(eval(inversion_config["shape_coords"])))
+theta = inversion_config["final_parameters"]
+mc = inversion_config["m_ref"]
 
 #%%
 data = forecast.data
@@ -39,6 +49,8 @@ mag_idx = np.searchsorted(magnitudes, mag_cutoff)
 rates = data[:, mag_idx]
 
 bounds = [-127,-113,30,45]
+mask = np.array([polygon.contains(Point(lat, lon)) 
+                 for lat, lon in zip(y,x)])
 
-plot_cartopy(x,y,rates,'Helmstetter (2007)',bounds=bounds)
+plot_cartopy(x[mask],y[mask],rates[mask],'Helmstetter (2007)',bounds=bounds)
 # %%
