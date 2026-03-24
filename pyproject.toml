@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seismic-priors"
+version = "0.1.0"
+description = "Spatial seismic prior distributions for bEPIC"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "shapely",
+]
+
+[tool.setuptools.packages.find]
+where = [".."]      # look in 2024_NEHRP/ for packages
+include = ["priors*"]
