@@ -78,11 +78,71 @@ class SeismicPrior:
         self.metadata = metadata if metadata is not None else {}
 
     # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _expand_to_bounds(lons, lats, grid, bounds, fill):
+        """
+        Expand a grid to cover bounds fully at its existing resolution.
+
+        Cells added outside the original lon/lat extent are filled with `fill`.
+        Existing cell values are preserved exactly.
+
+        Parameters
+        ----------
+        lons, lats : np.ndarray
+            1-D coordinate arrays of the existing grid (sorted ascending).
+        grid : np.ndarray
+            2-D value array, shape (len(lats), len(lons)).
+        bounds : tuple
+            (lon_min, lon_max, lat_min, lat_max) target extent.
+        fill : float, 'mean', or 'nan'
+            Value to assign to added cells.
+            'mean' — mean of existing non-NaN values.
+            'nan'  — np.nan (excluded from nansum normalization).
+            float  — a constant (e.g. 0.0).
+
+        Returns
+        -------
+        new_lons, new_lats : np.ndarray
+        new_grid : np.ndarray, shape (len(new_lats), len(new_lons))
+        """
+        lon_min, lon_max, lat_min, lat_max = bounds
+        dx = float(np.diff(lons).mean())
+        dy = float(np.diff(lats).mean())
+
+        new_lons = np.round(np.arange(lon_min, lon_max + dx / 2, dx), 10)
+        new_lats = np.round(np.arange(lat_min, lat_max + dy / 2, dy), 10)
+
+        if fill == 'mean':
+            fv = float(np.nanmean(grid))
+        elif fill == 'nan':
+            fv = np.nan
+        else:
+            fv = float(fill)
+
+        new_grid = np.full((len(new_lats), len(new_lons)), fv)
+
+        # Map existing rows/cols into the expanded grid by index
+        lat_idxs = np.round((lats - new_lats[0]) / dy).astype(int)
+        lon_idxs = np.round((lons - new_lons[0]) / dx).astype(int)
+
+        lat_mask = (lat_idxs >= 0) & (lat_idxs < len(new_lats))
+        lon_mask = (lon_idxs >= 0) & (lon_idxs < len(new_lons))
+
+        new_grid[np.ix_(lat_idxs[lat_mask], lon_idxs[lon_mask])] = \
+            grid[np.ix_(np.where(lat_mask)[0], np.where(lon_mask)[0])]
+
+        return new_lons, new_lats, new_grid
+
+    # ------------------------------------------------------------------
     # Construction from raw data sources
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_gear1(cls, data_path, polygon=None, bounds=(-127, -113, 30, 45)):
+    def from_gear1(cls, data_path, polygon=None, bounds=(-127, -113, 30, 45),
+                   fill_value=None, out_of_bounds_fill=None):
         """
         Build a prior from the GEAR1 global seismic hazard table.
 
@@ -101,6 +161,8 @@ class SeismicPrior:
         -------
         SeismicPrior
         """
+        if fill_value is None:
+            fill_value = 0.0
         df = pd.read_csv(
             data_path,
             sep=r'\s+',
@@ -136,12 +198,15 @@ class SeismicPrior:
             .pivot(index='lat', columns='lon', values='rate')
             .values
         )
-        grid = grid / grid.sum()
+        if out_of_bounds_fill is not None:
+            lons, lats, grid = cls._expand_to_bounds(lons, lats, grid, bounds, out_of_bounds_fill)
+        grid = grid / np.nansum(grid)
 
         return cls(name='gear1', lons=lons, lats=lats, grid=grid)
 
     @classmethod
-    def from_nshm(cls, data_path, polygon=None, bounds=(-127, -113, 30, 45)):
+    def from_nshm(cls, data_path, polygon=None, bounds=(-127, -113, 30, 45),
+                  fill_value=None, out_of_bounds_fill=None):
         """
         Build a prior from the USGS NSHM gridded moment-rate file.
 
@@ -158,6 +223,8 @@ class SeismicPrior:
         -------
         SeismicPrior
         """
+        if fill_value is None:
+            fill_value = 0.0
         df = pd.read_csv(
             data_path,
             sep=r'\s+',
@@ -187,13 +254,15 @@ class SeismicPrior:
             df.pivot(index='latitude', columns='longitude', values='moment_rate')
             .values
         )
-        grid = grid / grid.sum()
+        if out_of_bounds_fill is not None:
+            lons, lats, grid = cls._expand_to_bounds(lons, lats, grid, bounds, out_of_bounds_fill)
+        grid = grid / np.nansum(grid)
 
         return cls(name='nshm', lons=lons, lats=lats, grid=grid)
 
     @classmethod
     def from_helmstetter(cls, polygon=None, bounds=(-127, -113, 30, 45),
-                          mag_cutoff=6.0):
+                         mag_cutoff=6.0, fill_value=None, out_of_bounds_fill=None):
         """
         Build a prior from the Helmstetter (2007) aftershock forecast via pyCSEP.
 
@@ -212,6 +281,8 @@ class SeismicPrior:
         """
         import csep
         from csep.utils import datasets, time_utils
+        if fill_value is None:
+            fill_value = 0.0
 
         start_date = time_utils.strptime_to_utc_datetime('2006-11-12 00:00:00.0')
         end_date   = time_utils.strptime_to_utc_datetime('2011-11-12 00:00:00.0')
@@ -249,29 +320,47 @@ class SeismicPrior:
         grid = (
             pd.DataFrame({'lon': x, 'lat': y, 'rate': rates})
             .pivot(index='lat', columns='lon', values='rate')
-            .fillna(0.0)
+            .fillna(fill_value)
             .values
         )
-        grid = grid / grid.sum()
+        if out_of_bounds_fill is not None:
+            lons, lats, grid = cls._expand_to_bounds(lons, lats, grid, bounds, out_of_bounds_fill)
+        grid = grid / np.nansum(grid)
 
         return cls(name='helmstetter', lons=lons, lats=lats, grid=grid)
 
     @classmethod
-    def from_smooth_seismicity(cls):
+    def from_smooth_seismicity(cls, bounds=None, out_of_bounds_fill=None):
         """
         Load the pre-built US/Canada smooth seismicity prior.
 
         Reads prior_seis_grid_US_Canada.tt3 from the priors data_dir.
 
+        Parameters
+        ----------
+        bounds : tuple, optional
+            (lon_min, lon_max, lat_min, lat_max).  If provided together with
+            out_of_bounds_fill, the grid is expanded to cover this extent.
+        out_of_bounds_fill : float, 'mean', 'nan', or None
+            Fill value for cells added outside the file's native extent.
+            None (default) leaves the grid as-is.
+
         Returns
         -------
         SeismicPrior
         """
-        filepath = os.path.join(cls.data_dir, 'prior_seis_grid_US_Canada.tt3')
-        return cls.from_tt3(filepath, name='smooth_seismicity')
+        filepath = os.path.join(cls.data_dir, 'smooth_seismicity_data', 'prior_seis_grid_US_Canada.tt3')
+        p = cls.from_tt3(filepath, name='smooth_seismicity')
+        if bounds is not None and out_of_bounds_fill is not None:
+            p.lons, p.lats, p.grid = cls._expand_to_bounds(
+                p.lons, p.lats, p.grid, bounds, out_of_bounds_fill)
+            p.grid = p.grid / np.nansum(p.grid)
+        return p
+    
 
     @classmethod
-    def from_etas(cls, lats, lons, lambda_grid, forecast_time, metadata=None):
+    def from_etas(cls, lats, lons, lambda_grid, forecast_time, metadata=None,
+                  bounds=None, out_of_bounds_fill=None):
         """
         Build a prior from ETAS conditional intensity output.
 
@@ -293,6 +382,12 @@ class SeismicPrior:
         metadata : dict, optional
             Additional key-value pairs to store in the sidecar JSON, e.g.
             {'inversion_config': path, 'mc': 2.95, 'theta': {...}}.
+        bounds : tuple, optional
+            (lon_min, lon_max, lat_min, lat_max).  If provided together with
+            out_of_bounds_fill, the grid is expanded to cover this extent.
+        out_of_bounds_fill : float, 'mean', 'nan', or None
+            Fill value for cells added outside the ETAS polygon extent.
+            None (default) leaves the grid as-is.
 
         Returns
         -------
@@ -310,7 +405,10 @@ class SeismicPrior:
         grid_lons = np.asarray(grid.columns, dtype=float)
         grid_lats = np.asarray(grid.index,   dtype=float)
         grid_vals = grid.values
-        grid_vals = grid_vals / grid_vals.sum()
+        if bounds is not None and out_of_bounds_fill is not None:
+            grid_lons, grid_lats, grid_vals = cls._expand_to_bounds(
+                grid_lons, grid_lats, grid_vals, bounds, out_of_bounds_fill)
+        grid_vals = grid_vals / np.nansum(grid_vals)
 
         # Build metadata, always including forecast_time and generated_at
         ts = forecast_time
@@ -406,12 +504,12 @@ class SeismicPrior:
         SeismicPrior
         """
         with open(filepath, 'r') as f:
-            mx     = int(f.readline())
-            my     = int(f.readline())
-            xlower = float(f.readline())
-            ylower = float(f.readline())
-            dx     = float(f.readline())
-            dy     = float(f.readline())
+            mx     = int(f.readline().split()[0])
+            my     = int(f.readline().split()[0])
+            xlower = float(f.readline().split()[0])
+            ylower = float(f.readline().split()[0])
+            dx     = float(f.readline().split()[0])
+            dy     = float(f.readline().split()[0])
             grid_flipped = np.loadtxt(f)
 
         grid = np.flipud(grid_flipped)
