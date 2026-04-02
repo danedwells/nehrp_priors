@@ -36,8 +36,8 @@ candidates = [
     ('GEAR1',        'GEAR1_prior.tt3'),
     ('NSHM',         'USGS_NSHM_prior.tt3'),
     ('Helmstetter',  'helmstetter_prior.tt3'),
-    ('Smooth_Seis.', 'prior_seis_grid_US_Canada.tt3'),
-    ('ETAS',         'etas_prior_20080101_000000.tt3'),
+    ('Smooth_Seis.', 'prior_seis_grid_US_Canada_filled.tt3'),
+    ('ETAS',         'etas_prior_20080101_000000_filled.tt3'),
 ]
 
 # Check units
@@ -56,7 +56,7 @@ Existing Priors Links:
     or https://data.opensha.org/nshm23/reports/branch_averaged_gridded/#regional-nucleation-rates
     • Helmstetter (2007) – from PyCSEP package https://github.com/cseptesting/pycsep/blob/main/csep/artifacts/ExampleForecasts/GriddedForecasts/helmstetter_et_al.hkj-fromXML.dat
         AND from paper itself https://hal.science/hal-00195399/document
-    • Smoothed Seismicity (Williamson) – Google Drive https://drive.google.com/drive/folders/1qjJDD1CV43Afhp0xP7-Z9g4VJY8RIvYZ and/or email from Amy
+    • Smoothed Seismicity (Williamson) – Google Drive https://drive.google.com/drive/folders/1qjJDD1CV43Afhp0xP7-Z9g4VJY8RIvYZ and/or email from Amy Williamson @ Amy.Williamson@berkeley.edu
     • ETAS_2 output – Running on example catalog, see ETAS_2 github (forked from ETAS) https://github.com/danedwells/etas_2
 
 
@@ -74,6 +74,11 @@ names = list(priors.keys())
 n     = len(names)
 if n < 2:
     raise RuntimeError('Need at least 2 priors to compare.')
+
+# etas_raw = priors['ETAS'].grid
+# len(etas_raw[etas_raw==0])
+# etas_raw[etas_raw == 0] = 0.00005
+# plt.imshow(np.log10(etas_raw))
 
 #%%
 
@@ -210,7 +215,8 @@ for row, name_i in enumerate(names):
         ax.add_feature(cfeature.STATES, linewidth=0.4, edgecolor='black')
         ax.set_xticks([])
         ax.set_yticks([])
-
+        if name_j == 'helmstetter':
+            helm = grids[name_j]
         if row == col:
             g_log = np.where(grids[name_i] > 0, np.log10(grids[name_i]), np.nan)
             ax.imshow(g_log, origin='lower', extent=extent, transform=proj,
@@ -240,6 +246,44 @@ for row, name_i in enumerate(names):
 out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prior_comparison.png')
 plt.savefig(out_path, dpi=150, bbox_inches='tight')
 print(f'Saved to {out_path}')
+plt.show()
+
+#%%
+
+# ---------------------------------------------------------------------------
+# Figure 2: 1×n strip — diagonal panels only (log10 of each prior)
+# ---------------------------------------------------------------------------
+g_logs = {name: np.where(grids[name] > 0, np.log10(grids[name]), np.nan)
+          for name in names}
+
+fig2, axes2 = plt.subplots(
+    1, n,
+    figsize=(3.6 * n, 4.0),
+    subplot_kw={'projection': ccrs.PlateCarree()},
+)
+if n == 1:
+    axes2 = [axes2]
+
+for ax, name in zip(axes2, names):
+    ax.set_extent(extent, crs=proj)
+    ax.add_feature(cfeature.STATES, linewidth=0.4, edgecolor='black')
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(name, fontsize=9)
+    im = ax.imshow(
+        g_logs[name], origin='lower', extent=extent, transform=proj,
+        aspect='auto', cmap='viridis',
+    )
+    cbar2 = fig2.colorbar(im, ax=ax, orientation='horizontal',
+                          fraction=0.05, pad=0.06)
+    cbar2.set_label('log₁₀(p)', fontsize=7)
+    cbar2.ax.tick_params(labelsize=6)
+
+fig2.suptitle('Prior models — log₁₀ scale', fontsize=11, y=1.01)
+
+out_path2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prior_diagonal_strip.png')
+plt.savefig(out_path2, dpi=150, bbox_inches='tight')
+print(f'Saved to {out_path2}')
 plt.show()
 
 # %%

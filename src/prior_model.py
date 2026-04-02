@@ -112,9 +112,6 @@ class SeismicPrior:
         dx = float(np.diff(lons).mean())
         dy = float(np.diff(lats).mean())
 
-        new_lons = np.round(np.arange(lon_min, lon_max + dx / 2, dx), 10)
-        new_lats = np.round(np.arange(lat_min, lat_max + dy / 2, dy), 10)
-
         if fill == 'mean':
             fv = float(np.nanmean(grid))
         elif fill == 'nan':
@@ -122,17 +119,29 @@ class SeismicPrior:
         else:
             fv = float(fill)
 
+        # Extend outward from the existing grid's own origin so that existing
+        # cells always land on exact integer offsets in the new grid.
+        # Building from lon_min/lat_min risks a fractional-cell misalignment
+        # when the source grid is on a half-integer offset (e.g. 0.05° grids),
+        # which scatters data into wrong slots and creates checkerboard artifacts.
+        n_left  = max(int(np.ceil((lons[0] - lon_min) / dx)), 0)
+        n_right = max(int(np.ceil((lon_max - lons[-1]) / dx)), 0)
+        n_bot   = max(int(np.ceil((lats[0] - lat_min) / dy)), 0)
+        n_top   = max(int(np.ceil((lat_max - lats[-1]) / dy)), 0)
+
+        new_lons = np.round(np.concatenate([
+            lons[0] - np.arange(n_left, 0, -1) * dx,
+            lons,
+            lons[-1] + np.arange(1, n_right + 1) * dx,
+        ]), 10)
+        new_lats = np.round(np.concatenate([
+            lats[0] - np.arange(n_bot, 0, -1) * dy,
+            lats,
+            lats[-1] + np.arange(1, n_top + 1) * dy,
+        ]), 10)
+
         new_grid = np.full((len(new_lats), len(new_lons)), fv)
-
-        # Map existing rows/cols into the expanded grid by index
-        lat_idxs = np.round((lats - new_lats[0]) / dy).astype(int)
-        lon_idxs = np.round((lons - new_lons[0]) / dx).astype(int)
-
-        lat_mask = (lat_idxs >= 0) & (lat_idxs < len(new_lats))
-        lon_mask = (lon_idxs >= 0) & (lon_idxs < len(new_lons))
-
-        new_grid[np.ix_(lat_idxs[lat_mask], lon_idxs[lon_mask])] = \
-            grid[np.ix_(np.where(lat_mask)[0], np.where(lon_mask)[0])]
+        new_grid[n_bot:n_bot + len(lats), n_left:n_left + len(lons)] = grid
 
         return new_lons, new_lats, new_grid
 
@@ -262,7 +271,7 @@ class SeismicPrior:
 
     @classmethod
     def from_helmstetter(cls, polygon=None, bounds=(-127, -113, 30, 45),
-                         mag_cutoff=6.0, fill_value=None, out_of_bounds_fill=None):
+                         mag_cutoff=6.0, out_of_bounds_fill=None):
         """
         Build a prior from the Helmstetter (2007) aftershock forecast via pyCSEP.
 
@@ -281,8 +290,7 @@ class SeismicPrior:
         """
         import csep
         from csep.utils import datasets, time_utils
-        if fill_value is None:
-            fill_value = 0.0
+ 
 
         start_date = time_utils.strptime_to_utc_datetime('2006-11-12 00:00:00.0')
         end_date   = time_utils.strptime_to_utc_datetime('2011-11-12 00:00:00.0')
@@ -309,6 +317,7 @@ class SeismicPrior:
         x, y, rates = x[bounds_mask], y[bounds_mask], rates[bounds_mask]
 
         if polygon is not None:
+            print("Polygon applied")
             poly_mask = np.array([
                 polygon.contains(Point(xi, yi)) for xi, yi in zip(x, y)
             ])
@@ -320,7 +329,7 @@ class SeismicPrior:
         grid = (
             pd.DataFrame({'lon': x, 'lat': y, 'rate': rates})
             .pivot(index='lat', columns='lon', values='rate')
-            .fillna(fill_value)
+            .fillna(out_of_bounds_fill)
             .values
         )
         if out_of_bounds_fill is not None:
@@ -351,6 +360,7 @@ class SeismicPrior:
         """
         filepath = os.path.join(cls.data_dir, 'smooth_seismicity_data', 'prior_seis_grid_US_Canada.tt3')
         p = cls.from_tt3(filepath, name='smooth_seismicity')
+ 
         if bounds is not None and out_of_bounds_fill is not None:
             p.lons, p.lats, p.grid = cls._expand_to_bounds(
                 p.lons, p.lats, p.grid, bounds, out_of_bounds_fill)
@@ -400,11 +410,15 @@ class SeismicPrior:
         grid = (
             pd.DataFrame({'lon': lons, 'lat': lats, 'rate': lambda_grid})
             .pivot(index='lat', columns='lon', values='rate')
-            .fillna(0.0)
+            .fillna((out_of_bounds_fill))
         )
         grid_lons = np.asarray(grid.columns, dtype=float)
         grid_lats = np.asarray(grid.index,   dtype=float)
         grid_vals = grid.values
+        if out_of_bounds_fill is not None:
+            fv = float(np.nanmean(grid_vals)) if out_of_bounds_fill == 'mean' else float(out_of_bounds_fill)
+            grid_vals[grid_vals <= 1e-9] = fv
+        
         if bounds is not None and out_of_bounds_fill is not None:
             grid_lons, grid_lats, grid_vals = cls._expand_to_bounds(
                 grid_lons, grid_lats, grid_vals, bounds, out_of_bounds_fill)
