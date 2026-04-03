@@ -13,7 +13,6 @@ finest resolution) and renormalized before comparison.
 """
 
 import os
-import sys
 import json
 import numpy as np
 import matplotlib.pyplot as plt
@@ -23,14 +22,20 @@ from shapely.geometry import Point, Polygon
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
-from prior_model import SeismicPrior
+from priors import SeismicPrior
 
+
+# ---------------------------------------------------------------------------
+# Output directory
+# ---------------------------------------------------------------------------
+_here = os.path.dirname(os.path.abspath(__file__))
+figures_dir = os.path.join(_here, 'figures')
+os.makedirs(figures_dir, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Load priors
 # ---------------------------------------------------------------------------
-data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+data_dir = SeismicPrior.data_dir
 
 candidates = [
     ('GEAR1',        'GEAR1_prior.tt3'),
@@ -243,7 +248,7 @@ for row, name_i in enumerate(names):
             cbar.set_label('log₁₀(|Δ|) of priors', fontsize=8, labelpad=8)
 
 
-out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prior_comparison.png')
+out_path = os.path.join(figures_dir, 'prior_comparison.png')
 plt.savefig(out_path, dpi=150, bbox_inches='tight')
 print(f'Saved to {out_path}')
 plt.show()
@@ -281,7 +286,7 @@ for ax, name in zip(axes2, names):
 
 fig2.suptitle('Prior models — log₁₀ scale', fontsize=11, y=1.01)
 
-out_path2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prior_diagonal_strip.png')
+out_path2 = os.path.join(figures_dir, 'prior_diagonal_strip.png')
 plt.savefig(out_path2, dpi=150, bbox_inches='tight')
 print(f'Saved to {out_path2}')
 plt.show()

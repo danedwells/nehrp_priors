@@ -15,5 +15,7 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-where = [".."]      # look in 2024_NEHRP/ for packages
-include = ["priors*"]
+where = ["src"]
+
+[tool.setuptools.package-data]
+priors = ["data/**/*"]
