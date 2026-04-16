@@ -1,0 +1,14 @@
+# Input data — large files, not committed
+src/priors/data
+figures/
+
+# Python cache and build artifacts
+*/*__pycache__
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.vscode
+
+# Ignore png
+*.png

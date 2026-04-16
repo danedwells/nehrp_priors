@@ -214,8 +214,8 @@ class SeismicPrior:
         return cls(name='gear1', lons=lons, lats=lats, grid=grid)
 
     @classmethod
-    def from_nshm(cls, data_path, polygon=None, bounds=(-127, -113, 30, 45),
-                  fill_value=None, out_of_bounds_fill=None):
+    def from_nshm(cls, data_path, fault_data_path=None, polygon=None,
+                  bounds=(-127, -113, 30, 45), fill_value=None, out_of_bounds_fill=None):
         """
         Build a prior from the USGS NSHM gridded moment-rate file.
 
@@ -223,6 +223,9 @@ class SeismicPrior:
         ----------
         data_path : str
             Path to gridded_moment_rates.xyz (space-separated lon, lat, moment_rate).
+        fault_data_path : str, optional
+            Path to fault_moment_rates.xyz. Must share the same grid as data_path.
+            If provided, fault rates are added to the gridded rates before normalizing.
         polygon : shapely.geometry.Polygon, optional
             Region mask in standard (lon, lat) coordinates.
         bounds : tuple
@@ -241,7 +244,23 @@ class SeismicPrior:
             index_col=False,
             names=['longitude', 'latitude', 'moment_rate'],
         )
-        df = df.dropna(subset=['moment_rate'])
+        #df = df.dropna(subset=['moment_rate'])
+
+        # Values are log10(moment_rate); convert to linear throughout.
+        df['moment_rate'] = np.where(df['moment_rate'].notna(), 10 ** df['moment_rate'], 0.0)
+
+        if fault_data_path is not None:
+            df_fault = pd.read_csv(
+                fault_data_path,
+                sep=r'\s+',
+                header=None,
+                index_col=False,
+                names=['longitude', 'latitude', 'moment_rate'],
+            )
+            df_fault['moment_rate'] = np.where(df_fault['moment_rate'].notna(), 10 ** df_fault['moment_rate'], 0.0)
+            df['moment_rate'] = df['moment_rate'].values + df_fault['moment_rate'].values
+
+        df = df[df['moment_rate'] > 0].copy()
 
         lon_min, lon_max, lat_min, lat_max = bounds
         df = df[
@@ -441,6 +460,63 @@ class SeismicPrior:
 
         return cls(name='etas', lons=grid_lons, lats=grid_lats,
                    grid=grid_vals, metadata=full_metadata)
+
+    # ------------------------------------------------------------------
+    # Resampling
+    # ------------------------------------------------------------------
+
+    def resample(self, dx_deg, dy_deg=None):
+        """
+        Resample the prior to a coarser (or finer) regular grid.
+
+        Uses bilinear interpolation onto new grid centers, then renormalizes.
+        Intended for downsampling a high-resolution source (e.g. smooth
+        seismicity at ~0.02°) to match the resolution of other priors (~0.1°)
+        so that normalized cell values are on a comparable scale.
+
+        Parameters
+        ----------
+        dx_deg : float
+            Target longitude spacing in degrees.
+        dy_deg : float, optional
+            Target latitude spacing in degrees.  Defaults to dx_deg.
+
+        Returns
+        -------
+        SeismicPrior
+            New instance with the resampled grid.  Original is unchanged.
+        """
+        from scipy.interpolate import RegularGridInterpolator
+
+        if dy_deg is None:
+            dy_deg = dx_deg
+
+        new_lons = np.arange(self.lons[0], self.lons[-1] + dx_deg * 0.5, dx_deg)
+        new_lats = np.arange(self.lats[0], self.lats[-1] + dy_deg * 0.5, dy_deg)
+        # guard against floating-point overshoot
+        new_lons = new_lons[new_lons <= self.lons[-1] + dx_deg * 1e-6]
+        new_lats = new_lats[new_lats <= self.lats[-1] + dy_deg * 1e-6]
+
+        interp = RegularGridInterpolator(
+            (self.lats, self.lons), self.grid,
+            method='linear', bounds_error=False, fill_value=np.nan,
+        )
+        LAT_G, LON_G = np.meshgrid(new_lats, new_lons, indexing='ij')
+        new_grid = interp(
+            np.stack([LAT_G.ravel(), LON_G.ravel()], axis=1)
+        ).reshape(LAT_G.shape)
+
+        total = np.nansum(new_grid)
+        if total > 0:
+            new_grid = new_grid / total
+
+        return SeismicPrior(
+            name=self.name,
+            lons=new_lons,
+            lats=new_lats,
+            grid=new_grid,
+            metadata=dict(self.metadata),
+        )
 
     # ------------------------------------------------------------------
     # Serialization
