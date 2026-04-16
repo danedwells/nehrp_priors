@@ -56,8 +56,10 @@ class TimeDependentPriorUpdater(ABC):
     Interface for priors that need periodic recomputation.
 
     Subclasses must implement update() and append_events().  Both should be
-    cheap relative to the one-time model calibration that happens at
+    cheap (ideally) relative to the one-time model calibration that happens at
     construction time.
+
+    For a computationally expensive update, some alteration to this framework may be needed.
     """
 
     @abstractmethod
@@ -187,6 +189,7 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
         -------
         EtasPriorUpdater
         """
+        from numpy import array  # needed for eval() of shape_coords repr
         from shapely.geometry import Point, Polygon
 
         json_path = str(json_path)

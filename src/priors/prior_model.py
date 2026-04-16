@@ -433,7 +433,7 @@ class SeismicPrior:
         )
         grid_lons = np.asarray(grid.columns, dtype=float)
         grid_lats = np.asarray(grid.index,   dtype=float)
-        grid_vals = grid.values
+        grid_vals = grid.values.copy()
         if out_of_bounds_fill is not None:
             fv = float(np.nanmean(grid_vals)) if out_of_bounds_fill == 'mean' else float(out_of_bounds_fill)
             grid_vals[grid_vals <= 1e-9] = fv

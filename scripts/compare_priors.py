@@ -89,6 +89,8 @@ if n < 2:
 
 print("PRE - interpolation")
 for name, p in priors.items():
+    if name == 'smooth_seis':
+        ss = p.grid
     print(name, len(p.grid[p.grid==0]))
     print(np.nanmin(p.grid))
     fig,ax = plt.subplots(figsize=(8,6))
