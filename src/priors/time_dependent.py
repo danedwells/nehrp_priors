@@ -138,6 +138,7 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
         bounds: tuple | None = None,
         out_of_bounds_fill: float = 1e-4,
         metadata_base: dict | None = None,
+        max_lookback_days: float | None = None,
     ):
         self.theta              = theta
         self.mc                 = mc
@@ -147,6 +148,22 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
         self.bounds             = bounds
         self.out_of_bounds_fill = float(out_of_bounds_fill)
         self.metadata_base      = metadata_base or {}
+        self.max_lookback_days  = max_lookback_days
+
+        # Precompute time-independent spatial weights for the historical catalog.
+        # _w_hist[j, i] = aftershock_number(m_i) * space_decay(r_sq[j,i], m_i)
+        # Shape: (n_grid, n_hist), float32.  Haversine runs once here instead
+        # of once per update() call.
+        self._hist_times = self.catalog['time'].copy().reset_index(drop=True)
+        self._w_hist     = self._precompute_spatial_weights(self.catalog)
+
+        # Appended events (via append_events) are tracked separately so their
+        # spatial weights can be built incrementally — one haversine call per
+        # new event, not a full rebuild each time.
+        self._appended      = pd.DataFrame(
+            columns=['time', 'latitude', 'longitude', 'magnitude'])
+        self._w_appended    = np.empty((len(self.grid_lats_masked), 0), dtype=np.float32)
+        self._n_app_built   = 0   # events in _appended already reflected in _w_appended
 
     # ------------------------------------------------------------------
     # Construction
@@ -160,6 +177,7 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
         bounds: tuple | None = None,
         grid_spacing: float = 0.1,
         out_of_bounds_fill: float = 1e-4,
+        max_lookback_days: float | None = None,
     ) -> EtasPriorUpdater:
         """
         Build an updater from an etas_2 inversion output JSON file.
@@ -243,14 +261,34 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
         }
 
         return cls(
-            theta             = theta,
-            mc                = mc,
-            grid_lats_masked  = lats_flat[mask],
-            grid_lons_masked  = lons_flat[mask],
-            catalog           = catalog_df,
-            bounds            = bounds,
+            theta              = theta,
+            mc                 = mc,
+            grid_lats_masked   = lats_flat[mask],
+            grid_lons_masked   = lons_flat[mask],
+            catalog            = catalog_df,
+            bounds             = bounds,
             out_of_bounds_fill = out_of_bounds_fill,
-            metadata_base     = metadata_base,
+            metadata_base      = metadata_base,
+            max_lookback_days  = max_lookback_days,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _precompute_spatial_weights(self, df: pd.DataFrame) -> np.ndarray:
+        """Return (n_grid, n_events) float32 spatial weight matrix for df."""
+        from etas.intensity import _compute_spatial_weights
+        if df.empty:
+            return np.empty((len(self.grid_lats_masked), 0), dtype=np.float32)
+        # Explicit float64 cast guards against object-dtype columns that arise
+        # when concatenating into the initially-empty _appended DataFrame.
+        return _compute_spatial_weights(
+            self.grid_lats_masked, self.grid_lons_masked,
+            df['latitude'].values.astype(np.float64),
+            df['longitude'].values.astype(np.float64),
+            df['magnitude'].values.astype(np.float64),
+            self.theta, self.mc,
         )
 
     # ------------------------------------------------------------------
@@ -263,13 +301,28 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
 
         Duplicates are dropped by matching on (time, latitude, longitude)
         after concatenation, so it is safe to call with overlapping batches.
+        Events that are genuinely new (not already in the historical catalog)
+        are also stored in _appended so their spatial weights can be built
+        incrementally — avoiding a full haversine recompute over _w_hist.
         """
+        hist_idx = self.catalog.set_index(['time', 'latitude', 'longitude']).index
+        new_idx  = new_events.set_index(['time', 'latitude', 'longitude']).index
+        truly_new = new_events[~new_idx.isin(hist_idx)].copy()
+
         self.catalog = (
             pd.concat([self.catalog, new_events], ignore_index=True)
             .drop_duplicates(subset=['time', 'latitude', 'longitude'])
             .sort_values('time')
             .reset_index(drop=True)
         )
+
+        if not truly_new.empty:
+            self._appended = (
+                pd.concat([self._appended, truly_new], ignore_index=True)
+                .drop_duplicates(subset=['time', 'latitude', 'longitude'])
+            )
+            # _n_app_built is intentionally not updated here; update() will
+            # build weights only for the new tail on the next call.
 
     def update(
         self,
@@ -279,8 +332,12 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
         """
         Evaluate the ETAS intensity and return a fresh SeismicPrior.
 
-        This is the fast path — only the intensity evaluation runs.  No
-        inversion, no file I/O unless cache_path is provided.
+        Uses precomputed spatial weights (_w_hist) so haversine is not
+        recomputed on each call on the entire catalag (only appended events).  
+        Only the time-decay vector is evaluated
+        per update, reducing cost from O(n_grid × n_catalog) haversine
+        operations to O(n_catalog) scalar operations plus a matrix–vector
+        product.
 
         Parameters
         ----------
@@ -295,24 +352,56 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
         SeismicPrior
             Ready to assign to params.prior in bEPIC.
         """
-        from etas.intensity import conditional_intensity_grid
+        import datetime
+        from etas.intensity import _compute_time_decay
 
-        lambda_vals = conditional_intensity_grid(
-            forecast_time,
-            self.grid_lats_masked,
-            self.grid_lons_masked,
-            self.catalog,
-            self.theta,
-            self.mc,
-        )
+        mu = 10 ** self.theta['log10_mu']
+
+        n_app = len(self._appended)
+        if n_app > self._n_app_built:
+            new_chunk = self._precompute_spatial_weights(
+                self._appended.iloc[self._n_app_built:])
+            self._w_appended  = np.hstack([self._w_appended, new_chunk])
+            self._n_app_built = n_app
+
+        # --- Historical contribution (spatial weights precomputed at init) ---
+        # Mask events: only before forecast time
+        hist_mask = self._hist_times < forecast_time
+        if self.max_lookback_days is not None:
+            cutoff    = forecast_time - datetime.timedelta(days=self.max_lookback_days)
+            # Add to the mask - must be after the time cutoff (2 years?)
+            hist_mask = hist_mask & (self._hist_times >= cutoff)
+
+        # IF any events in historical catalog within mask time
+        if hist_mask.any():
+            td          = _compute_time_decay(
+                              self._hist_times[hist_mask], forecast_time, self.theta)
+            lambda_vals = (mu + (self._w_hist[:, hist_mask.values] * td).sum(axis=1))
+        # Else background seismicity rate (mu)
+        else:
+            lambda_vals = np.full(len(self.grid_lats_masked), mu)
+
+        # --- Appended-events contribution (weights built once per append) ---
+        # This repeats the same logic as above, but for the appended events.
+        if self._w_appended is not None and not self._appended.empty:
+            app_mask = self._appended['time'] < forecast_time
+            if self.max_lookback_days is not None:
+                cutoff   = forecast_time - datetime.timedelta(days=self.max_lookback_days)
+                app_mask = app_mask & (self._appended['time'] >= cutoff)
+            if app_mask.any():
+                td_app      = _compute_time_decay(
+                                  self._appended.loc[app_mask, 'time'],
+                                  forecast_time, self.theta)
+                lambda_vals = lambda_vals + (
+                    self._w_appended[:, app_mask.values] * td_app).sum(axis=1)
 
         prior = SeismicPrior.from_etas(
-            lats             = self.grid_lats_masked,
-            lons             = self.grid_lons_masked,
-            lambda_grid      = lambda_vals,
-            forecast_time    = forecast_time,
-            metadata         = dict(self.metadata_base),
-            bounds           = self.bounds,
+            lats               = self.grid_lats_masked,
+            lons               = self.grid_lons_masked,
+            lambda_grid        = lambda_vals.astype(float),
+            forecast_time      = forecast_time,
+            metadata           = dict(self.metadata_base),
+            bounds             = self.bounds,
             out_of_bounds_fill = self.out_of_bounds_fill,
         )
 

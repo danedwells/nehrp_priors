@@ -10,9 +10,8 @@ Loads the pre-inverted ETAS model, then builds three priors:
 Edit the "CONFIGURE" sections below to change the forecast time, mainshock
 location/magnitude, or aftershock sequence, then run all cells.
 
-Requirements: priors, etas_2 (both pip install -e'd), cartopy, matplotlib.
 """
-
+#%%
 import os
 import numpy as np
 import pandas as pd
@@ -25,12 +24,14 @@ from priors import EtasPriorUpdater
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
+REF_PATH =  os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 ETAS_JSON    = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
+    REF_PATH,
     '..', 'etas_2', 'output_data', 'parameters_0.json',
 )
 CATALOG_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
+    REF_PATH,
     '..', 'etas_2', 'input_data', 'example_catalog.csv',
 )
 
@@ -86,6 +87,7 @@ updater = EtasPriorUpdater.from_inversion_json(
     json_path    = ETAS_JSON,
     catalog_df   = catalog,
     bounds       = BOUNDS,
+    out_of_bounds_fill = 1e-6,
     grid_spacing = GRID_SPACING,
 )
 print(updater)
@@ -204,3 +206,5 @@ print(f"\nPrior value at mainshock epicentre ({ms_lat}°N, {ms_lon}°E):")
 print(f"  Baseline:         {grid_value_at(prior_baseline,  ms_lat, ms_lon):.4e}")
 print(f"  After mainshock:  {grid_value_at(prior_mainshock, ms_lat, ms_lon):.4e}")
 print(f"  After sequence:   {grid_value_at(prior_sequence,  ms_lat, ms_lon):.4e}")
+
+# %%
