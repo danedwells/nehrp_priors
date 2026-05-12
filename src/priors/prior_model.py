@@ -388,6 +388,94 @@ class SeismicPrior:
     
 
     @classmethod
+    def from_kde_seismicity(cls, catalog,
+                             bounds=None,
+                             grid_size=100,
+                             bw_method='scott',
+                             lon_col='longitude', lat_col='latitude',
+                             out_of_bounds_fill=None,
+                             name='kde_seismicity'):
+        """
+        Build a prior from a Gaussian KDE of earthquake locations.
+
+        Parameters
+        ----------
+        catalog : pd.DataFrame or array-like
+            Earthquake locations.  If a DataFrame, columns named by lon_col
+            and lat_col are used.  If array-like, must be shape (N, 2) as
+            [[lon, lat], ...].
+        bounds : tuple, optional
+            (lon_min, lon_max, lat_min, lat_max) defining the output grid
+            extent.  If None, inferred from the catalog with a 1° buffer.
+        grid_size : int or (int, int)
+            Number of grid points in the (longitude, latitude) directions.
+            Default 100 × 100.
+        bw_method : str or scalar
+            Bandwidth passed to scipy.stats.gaussian_kde.  Default 'scott'.
+        lon_col, lat_col : str
+            Column names to use when catalog is a DataFrame.
+        out_of_bounds_fill : float, 'mean', 'nan', or None
+            If provided, the grid is expanded to fully cover bounds via
+            _expand_to_bounds (useful when bounds is inferred from a sparse
+            catalog that doesn't reach all edges).
+        name : str
+            Label for the returned SeismicPrior.
+
+        Returns
+        -------
+        SeismicPrior
+        """
+        from scipy.stats import gaussian_kde
+
+        if hasattr(catalog, 'columns'):
+            lons_pts = catalog[lon_col].values.astype(float)
+            lats_pts = catalog[lat_col].values.astype(float)
+        else:
+            arr = np.asarray(catalog, dtype=float)
+            lons_pts = arr[:, 0]
+            lats_pts = arr[:, 1]
+
+        if bounds is None:
+            pad = 1.0
+            bounds = (
+                float(lons_pts.min()) - pad, float(lons_pts.max()) + pad,
+                float(lats_pts.min()) - pad, float(lats_pts.max()) + pad,
+            )
+        lon_min, lon_max, lat_min, lat_max = bounds
+
+        if np.isscalar(grid_size):
+            nx, ny = int(grid_size), int(grid_size)
+        else:
+            nx, ny = int(grid_size[0]), int(grid_size[1])
+
+        kde = gaussian_kde(
+            np.vstack([lons_pts, lats_pts]),
+            bw_method=bw_method,
+        )
+
+        lons = np.linspace(lon_min, lon_max, nx)
+        lats = np.linspace(lat_min, lat_max, ny)
+        xx, yy = np.meshgrid(lons, lats)
+        grid = kde(np.vstack([xx.ravel(), yy.ravel()])).reshape(xx.shape)
+        grid = np.clip(grid, 0.0, None)
+
+        if out_of_bounds_fill is not None:
+            lons, lats, grid = cls._expand_to_bounds(
+                lons, lats, grid, bounds, out_of_bounds_fill)
+
+        grid = grid / np.nansum(grid)
+
+        metadata = {
+            'bw_method':    str(bw_method),
+            'grid_size':    [nx, ny],
+            'n_events':     int(len(lons_pts)),
+            'bounds':       list(bounds),
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+        }
+
+        return cls(name=name, lons=lons, lats=lats, grid=grid, metadata=metadata)
+
+    @classmethod
     def from_etas(cls, lats, lons, lambda_grid, forecast_time, metadata=None,
                   bounds=None, out_of_bounds_fill=None):
         """
