@@ -41,6 +41,10 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import Point
 
+from scipy.stats import gaussian_kde
+from KDEpy import TreeKDE
+
+
 
 class SeismicPrior:
     """
@@ -280,6 +284,7 @@ class SeismicPrior:
 
         grid = (
             df.pivot(index='latitude', columns='longitude', values='moment_rate')
+            .fillna(fill_value)
             .values
         )
         if out_of_bounds_fill is not None:
@@ -386,94 +391,144 @@ class SeismicPrior:
             p.grid = p.grid / np.nansum(p.grid)
         return p
     
+    # @staticmethod
+    # def adaptive_kde(lons_pts, lats_pts, grid_lons, grid_lats, alpha=0.5, pilot_bw='scott'):
+    #     from KDEpy import TreeKDE
+    #     from sklearn.neighbors import KernelDensity
 
-    @classmethod
-    def from_kde_seismicity(cls, catalog,
-                             bounds=None,
-                             grid_size=100,
-                             bw_method='scott',
-                             lon_col='longitude', lat_col='latitude',
-                             out_of_bounds_fill=None,
-                             name='kde_seismicity'):
-        """
-        Build a prior from a Gaussian KDE of earthquake locations.
+    #     points = np.column_stack([lons_pts, lats_pts])   # (N, 2)
+    #     n, d = points.shape
 
-        Parameters
-        ----------
-        catalog : pd.DataFrame or array-like
-            Earthquake locations.  If a DataFrame, columns named by lon_col
-            and lat_col are used.  If array-like, must be shape (N, 2) as
-            [[lon, lat], ...].
-        bounds : tuple, optional
-            (lon_min, lon_max, lat_min, lat_max) defining the output grid
-            extent.  If None, inferred from the catalog with a 1° buffer.
-        grid_size : int or (int, int)
-            Number of grid points in the (longitude, latitude) directions.
-            Default 100 × 100.
-        bw_method : str or scalar
-            Bandwidth passed to scipy.stats.gaussian_kde.  Default 'scott'.
-        lon_col, lat_col : str
-            Column names to use when catalog is a DataFrame.
-        out_of_bounds_fill : float, 'mean', 'nan', or None
-            If provided, the grid is expanded to fully cover bounds via
-            _expand_to_bounds (useful when bounds is inferred from a sparse
-            catalog that doesn't reach all edges).
-        name : str
-            Label for the returned SeismicPrior.
+    #     # Scott's rule: n^(-1/(d+4)); Silverman: (n*(d+2)/4)^(-1/(d+4))
+    #     if pilot_bw == 'scott':
+    #         h_global = n ** (-1.0 / (d + 4))
+    #     elif pilot_bw == 'silverman':
+    #         h_global = (n * (d + 2) / 4.0) ** (-1.0 / (d + 4))
+    #     else:
+    #         h_global = float(pilot_bw)
 
-        Returns
-        -------
-        SeismicPrior
-        """
-        from scipy.stats import gaussian_kde
+    #     # Stage 1: pilot density at data points via ball-tree KDE — O(N log N)
+    #     # vs. scipy gaussian_kde which is O(N²) and dominates runtime for large N
+    #     f_pilot = np.exp(
+    #         KernelDensity(kernel='gaussian', bandwidth=h_global)
+    #         .fit(points)
+    #         .score_samples(points)
+    #     )
 
-        if hasattr(catalog, 'columns'):
-            lons_pts = catalog[lon_col].values.astype(float)
-            lats_pts = catalog[lat_col].values.astype(float)
-        else:
-            arr = np.asarray(catalog, dtype=float)
-            lons_pts = arr[:, 0]
-            lats_pts = arr[:, 1]
+    #     # Stage 2: local bandwidth per point
+    #     g = np.exp(np.mean(np.log(np.clip(f_pilot, 1e-30, None))))
+    #     bw_per_point = h_global * (g / f_pilot) ** alpha  # shape (N,)
 
-        if bounds is None:
-            pad = 1.0
-            bounds = (
-                float(lons_pts.min()) - pad, float(lons_pts.max()) + pad,
-                float(lats_pts.min()) - pad, float(lats_pts.max()) + pad,
-            )
-        lon_min, lon_max, lat_min, lat_max = bounds
+    #     # Stage 3: evaluate adaptive KDE on grid
+    #     xx, yy = np.meshgrid(grid_lons, grid_lats)
+    #     grid_pts = np.column_stack([xx.ravel(), yy.ravel()])
+    #     density = (TreeKDE('gaussian', bw=bw_per_point)
+    #                 .fit(points)
+    #                 .evaluate(grid_pts))
+    #     return density.reshape(xx.shape)
 
-        if np.isscalar(grid_size):
-            nx, ny = int(grid_size), int(grid_size)
-        else:
-            nx, ny = int(grid_size[0]), int(grid_size[1])
+    # @classmethod
+    # def from_kde_seismicity(cls, catalog,
+    #                          bounds=None,
+    #                          grid_size=100,
+    #                          bw_method='scott',
+    #                          adaptive=False,
+    #                          adaptive_alpha=0.5,
+    #                          lon_col='longitude', lat_col='latitude',
+    #                          out_of_bounds_fill=None,
+    #                          name='kde_seismicity'):
+    #     """
+    #     Build a prior from a Gaussian KDE of earthquake locations.
 
-        kde = gaussian_kde(
-            np.vstack([lons_pts, lats_pts]),
-            bw_method=bw_method,
-        )
+    #     Parameters
+    #     ----------
+    #     catalog : pd.DataFrame or array-like
+    #         Earthquake locations.  If a DataFrame, columns named by lon_col
+    #         and lat_col are used.  If array-like, must be shape (N, 2) as
+    #         [[lon, lat], ...].
+    #     bounds : tuple, optional
+    #         (lon_min, lon_max, lat_min, lat_max) defining the output grid
+    #         extent.  If None, inferred from the catalog with a 1° buffer.
+    #     grid_size : int or (int, int)
+    #         Number of grid points in the (longitude, latitude) directions.
+    #         Default 100 × 100.
+    #     bw_method : str or scalar
+    #         Bandwidth for scipy.stats.gaussian_kde (fixed mode) or the pilot
+    #         KDE (adaptive mode).  Default 'scott'.
+    #     adaptive : bool
+    #         If True, use a two-stage adaptive (variable-bandwidth) KDE via
+    #         KDEpy.TreeKDE.  Points in dense regions get a narrower kernel;
+    #         sparse regions get a wider one.  Default False.
+    #     adaptive_alpha : float
+    #         Sensitivity of the local bandwidth adjustment (0 = fixed, 0.5 =
+    #         standard Silverman, 1.0 = maximum adaptation).  Only used when
+    #         adaptive=True.  Default 0.5.
+    #     lon_col, lat_col : str
+    #         Column names to use when catalog is a DataFrame.
+    #     out_of_bounds_fill : float, 'mean', 'nan', or None
+    #         If provided, the grid is expanded to fully cover bounds via
+    #         _expand_to_bounds (useful when bounds is inferred from a sparse
+    #         catalog that doesn't reach all edges).
+    #     name : str
+    #         Label for the returned SeismicPrior.
 
-        lons = np.linspace(lon_min, lon_max, nx)
-        lats = np.linspace(lat_min, lat_max, ny)
-        xx, yy = np.meshgrid(lons, lats)
-        grid = kde(np.vstack([xx.ravel(), yy.ravel()])).reshape(xx.shape)
-        grid = np.clip(grid, 0.0, None)
+    #     Returns
+    #     -------
+    #     SeismicPrior
+    #     """
+    #     from scipy.stats import gaussian_kde
 
-        if out_of_bounds_fill is not None:
-            lons, lats, grid = cls._expand_to_bounds(
-                lons, lats, grid, bounds, out_of_bounds_fill)
+    #     if hasattr(catalog, 'columns'):
+    #         lons_pts = catalog[lon_col].values.astype(float)
+    #         lats_pts = catalog[lat_col].values.astype(float)
+    #     else:
+    #         arr = np.asarray(catalog, dtype=float)
+    #         lons_pts = arr[:, 0]
+    #         lats_pts = arr[:, 1]
 
-        grid = grid / np.nansum(grid)
+    #     if bounds is None:
+    #         pad = 1.0
+    #         bounds = (
+    #             float(lons_pts.min()) - pad, float(lons_pts.max()) + pad,
+    #             float(lats_pts.min()) - pad, float(lats_pts.max()) + pad,
+    #         )
+    #     lon_min, lon_max, lat_min, lat_max = bounds
 
-        metadata = {
-            'bw_method':    str(bw_method),
-            'grid_size':    [nx, ny],
-            'n_events':     int(len(lons_pts)),
-            'bounds':       list(bounds),
-            'generated_at': datetime.now(timezone.utc).isoformat(),
-        }
+    #     if np.isscalar(grid_size):
+    #         nx, ny = int(grid_size), int(grid_size)
+    #     else:
+    #         nx, ny = int(grid_size[0]), int(grid_size[1])
 
-        return cls(name=name, lons=lons, lats=lats, grid=grid, metadata=metadata)
+    #     lons = np.linspace(lon_min, lon_max, nx)
+    #     lats = np.linspace(lat_min, lat_max, ny)
+
+    #     if adaptive:
+    #         grid = cls.adaptive_kde(lons_pts, lats_pts, lons, lats,
+    #                                 alpha=adaptive_alpha, pilot_bw=bw_method)
+    #     else:
+    #         kde = gaussian_kde(np.vstack([lons_pts, lats_pts]), bw_method=bw_method)
+    #         xx, yy = np.meshgrid(lons, lats)
+    #         grid = kde(np.vstack([xx.ravel(), yy.ravel()])).reshape(xx.shape)
+
+    #     grid = np.clip(grid, 0.0, None)
+
+    #     if out_of_bounds_fill is not None:
+    #         lons, lats, grid = cls._expand_to_bounds(
+    #             lons, lats, grid, bounds, out_of_bounds_fill)
+
+    #     grid = grid / np.nansum(grid)
+
+    #     metadata = {
+    #         'bw_method':      str(bw_method),
+    #         'adaptive':       adaptive,
+    #         'adaptive_alpha': adaptive_alpha if adaptive else None,
+    #         'grid_size':      [nx, ny],
+    #         'n_events':       int(len(lons_pts)),
+    #         'bounds':         list(bounds),
+    #         'generated_at':   datetime.now(timezone.utc).isoformat(),
+    #     }
+
+    #     return cls(name=name, lons=lons, lats=lats, grid=grid, metadata=metadata)
 
     @classmethod
     def from_etas(cls, lats, lons, lambda_grid, forecast_time, metadata=None,

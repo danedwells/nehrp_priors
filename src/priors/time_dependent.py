@@ -126,6 +126,23 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
     metadata_base : dict or None
         Fixed metadata fields written to every prior's sidecar JSON
         (e.g. inversion file path, catalog path).
+    bg_field : np.ndarray, shape (n_grid,), optional
+        Precomputed spatially-varying background rate mu(x, y), e.g. from
+        etas.intensity._compute_background_field. None (default) preserves
+        the original flat-mu behaviour. Time-invariant — computed once here,
+        never recomputed in update(), since the free_background KDE it comes
+        from has no way to account for events that arrive after the training
+        catalog without a full re-inversion. Prefer constructing via
+        from_inversion_json(use_spatial_background=True) rather than passing
+        this directly.
+    source_kappa_hist : pd.Series, optional
+        Per-event fitted productivity (free_productivity's source_kappa),
+        indexed exactly like `catalog`. Events with no entry (including any
+        later added via append_events) fall back to the population law
+        k0*exp(a*(m-mc)) automatically. None (default) preserves the original
+        population-law-only behaviour. Prefer constructing via
+        from_inversion_json(use_spatial_productivity=True) rather than
+        passing this directly.
     """
 
     def __init__(
@@ -139,6 +156,8 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
         out_of_bounds_fill: float = 1e-4,
         metadata_base: dict | None = None,
         max_lookback_days: float | None = None,
+        bg_field: np.ndarray | None = None,
+        source_kappa_hist: pd.Series | None = None,
     ):
         self.theta              = theta
         self.mc                 = mc
@@ -149,11 +168,14 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
         self.out_of_bounds_fill = float(out_of_bounds_fill)
         self.metadata_base      = metadata_base or {}
         self.max_lookback_days  = max_lookback_days
+        self._bg_field          = (np.asarray(bg_field, dtype=float)
+                                    if bg_field is not None else None)
+        self._kappa_hist        = source_kappa_hist
 
         # Precompute time-independent spatial weights for the historical catalog.
         # _w_hist[j, i] = aftershock_number(m_i) * space_decay(r_sq[j,i], m_i)
         # Shape: (n_grid, n_hist), float32.  Haversine runs once here instead
-        # of once per update() call.
+        # of once per update() call. Uses self._kappa_hist (set above) if given.
         self._hist_times = self.catalog['time'].copy().reset_index(drop=True)
         self._w_hist     = self._precompute_spatial_weights(self.catalog)
 
@@ -178,6 +200,8 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
         grid_spacing: float = 0.1,
         out_of_bounds_fill: float = 1e-4,
         max_lookback_days: float | None = None,
+        use_spatial_background: bool = False,
+        use_spatial_productivity: bool = False,
     ) -> EtasPriorUpdater:
         """
         Build an updater from an etas_2 inversion output JSON file.
@@ -202,6 +226,27 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
             0.1° matches the native resolution of GEAR1/NSHM/Helmstetter.
         out_of_bounds_fill : float
             Rate assigned outside the polygon.
+        use_spatial_background : bool
+            If True, replace the flat scalar background rate with a
+            spatially-varying mu(x, y) built from the inversion's
+            free_background KDE output (trig_and_bg_probs_{id}.csv, i.e.
+            'fn_ip' in the JSON). Requires the inversion to have been run
+            with free_background=True. Time-invariant: computed once here,
+            not updated as new events arrive (there's no way to know a new
+            event's P_background without a full re-inversion). Default False
+            preserves the original flat-mu behaviour.
+        use_spatial_productivity : bool
+            If True, use each historical event's individually-fitted
+            productivity (free_productivity's source_kappa, from
+            sources_{id}.csv, i.e. 'fn_src' in the JSON) in place of the
+            population law k0*exp(a*(m-mc)) wherever a fitted value exists.
+            Requires the inversion to have been run with
+            free_productivity=True AND store_results(...,
+            store_spatial_fields=True) (so sources_{id}.csv has
+            latitude/longitude). Events with no fitted kappa — including any
+            appended later via append_events() — fall back to the population
+            law automatically. Default False preserves the original
+            population-law-only behaviour.
 
         Returns
         -------
@@ -216,6 +261,14 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
 
         theta = config['final_parameters']
         mc    = float(config['m_ref'])
+
+        if (use_spatial_background or use_spatial_productivity) and \
+                config.get('three_dim', False):
+            raise NotImplementedError(
+                "use_spatial_background/use_spatial_productivity are not "
+                "supported for three_dim=True inversions — the background "
+                "KDE and spatial weights are inherently 2D lat/lon."
+            )
 
         # shape_coords is stored as a string repr of a numpy array
         # in (lat, lon) order — matching the convention in conditional_intensity.py
@@ -250,45 +303,143 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
             polygon.contains(Point(la, lo))
             for la, lo in zip(lats_flat, lons_flat)
         ])
+        grid_lats_masked = lats_flat[mask]
+        grid_lons_masked = lons_flat[mask]
+
+        bg_field = None
+        if use_spatial_background:
+            if not config.get('free_background', False):
+                raise ValueError(
+                    f"use_spatial_background=True but {json_path} was produced "
+                    f"with free_background=False; no per-event P_background is "
+                    f"available to build a spatial background field."
+                )
+            fn_ip = config.get('fn_ip')
+            if not fn_ip:
+                raise ValueError(
+                    f"use_spatial_background=True but 'fn_ip' is missing from "
+                    f"{json_path}."
+                )
+            bg_df = pd.read_csv(fn_ip, index_col=0)
+            missing = {'latitude', 'longitude', 'P_background'} - set(bg_df.columns)
+            if missing:
+                raise ValueError(
+                    f"{fn_ip} is missing required column(s) {sorted(missing)} "
+                    f"for use_spatial_background."
+                )
+            from etas.intensity import _compute_background_field
+            # Not filtered to the polygon — matches how _w_hist already lets
+            # events outside the polygon contribute to near-boundary cells.
+            bg_field = _compute_background_field(
+                grid_lats_masked, grid_lons_masked,
+                bg_df['latitude'].values, bg_df['longitude'].values,
+                bg_df['P_background'].values,
+                config['bw_sq'], config['timewindow_length'],
+            )
+
+        kappa_hist = None
+        if use_spatial_productivity:
+            if not config.get('free_productivity', False):
+                raise ValueError(
+                    f"use_spatial_productivity=True but {json_path} was produced "
+                    f"with free_productivity=False; no per-event source_kappa is "
+                    f"available."
+                )
+            fn_src = config.get('fn_src')
+            if not fn_src:
+                raise ValueError(
+                    f"use_spatial_productivity=True but 'fn_src' is missing from "
+                    f"{json_path}."
+                )
+            src_df = pd.read_csv(fn_src, index_col=0)
+            if not {'latitude', 'longitude'} <= set(src_df.columns):
+                raise ValueError(
+                    f"{fn_src} lacks latitude/longitude columns — it must be "
+                    f"produced with store_results(..., store_spatial_fields=True) "
+                    f"to use use_spatial_productivity."
+                )
+            # Merge by content key (latitude, longitude), NOT by index:
+            # EtasPriorUpdater.catalog's index is not stable (append_events
+            # resets it, and some callers load catalog_df without
+            # index_col=0), so it may not correspond to sources_{id}.csv's
+            # original inversion row ids at all.
+            merged = catalog_df.reset_index().merge(
+                src_df[['latitude', 'longitude', 'source_kappa']],
+                on=['latitude', 'longitude'], how='left',
+            )
+            n_unmatched = int(merged['source_kappa'].isna().sum())
+            if n_unmatched:
+                import warnings
+                warnings.warn(
+                    f"use_spatial_productivity: {n_unmatched}/{len(merged)} "
+                    f"catalog_df rows had no matching source_kappa in {fn_src} "
+                    f"(they will use the population-law productivity instead)."
+                )
+            kappa_hist = pd.Series(
+                merged['source_kappa'].values, index=catalog_df.index)
 
         metadata_base = {
-            'inversion_json':   json_path,
-            'catalog':          config.get('fn_catalog', ''),
-            'timewindow_start': config.get('timewindow_start', ''),
-            'timewindow_end':   config.get('timewindow_end', ''),
-            'grid_spacing_deg': grid_spacing,
-            'n_grid_points':    int(mask.sum()),
+            'inversion_json':          json_path,
+            'catalog':                 config.get('fn_catalog', ''),
+            'timewindow_start':        config.get('timewindow_start', ''),
+            'timewindow_end':          config.get('timewindow_end', ''),
+            'grid_spacing_deg':        grid_spacing,
+            'n_grid_points':           int(mask.sum()),
+            'use_spatial_background':  use_spatial_background,
+            'use_spatial_productivity': use_spatial_productivity,
         }
 
         return cls(
             theta              = theta,
             mc                 = mc,
-            grid_lats_masked   = lats_flat[mask],
-            grid_lons_masked   = lons_flat[mask],
+            grid_lats_masked   = grid_lats_masked,
+            grid_lons_masked   = grid_lons_masked,
             catalog            = catalog_df,
             bounds             = bounds,
             out_of_bounds_fill = out_of_bounds_fill,
             metadata_base      = metadata_base,
             max_lookback_days  = max_lookback_days,
+            bg_field           = bg_field,
+            source_kappa_hist  = kappa_hist,
         )
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _precompute_spatial_weights(self, df: pd.DataFrame) -> np.ndarray:
-        """Return (n_grid, n_events) float32 spatial weight matrix for df."""
+    def _precompute_spatial_weights(self, df: pd.DataFrame,
+                                     use_kappa: bool = True) -> np.ndarray:
+        """Return (n_grid, n_events) float32 spatial weight matrix for df.
+
+        use_kappa : whether to look up self._kappa_hist (by df's index) for
+            per-event productivity, falling back row-wise to the population
+            law k0*exp(a*(m-mc)) wherever there's no match. Only meaningful
+            for the original historical catalog: appended (post-training)
+            events have no fitted kappa by construction, so the call site
+            building weights for _appended passes use_kappa=False explicitly
+            rather than relying on an index-based lookup that could
+            coincidentally collide with the historical catalog's index.
+        """
         from etas.intensity import _compute_spatial_weights
         if df.empty:
             return np.empty((len(self.grid_lats_masked), 0), dtype=np.float32)
         # Explicit float64 cast guards against object-dtype columns that arise
         # when concatenating into the initially-empty _appended DataFrame.
+        mags = df['magnitude'].values.astype(np.float64)
+
+        kappas = None
+        if use_kappa and self._kappa_hist is not None:
+            matched = self._kappa_hist.reindex(df.index)
+            pop = (10 ** self.theta['log10_k0']) * np.exp(
+                self.theta['a'] * (mags - self.mc))
+            kappas = np.where(matched.notna().values,
+                              matched.values.astype(np.float64), pop)
+
         return _compute_spatial_weights(
             self.grid_lats_masked, self.grid_lons_masked,
             df['latitude'].values.astype(np.float64),
             df['longitude'].values.astype(np.float64),
-            df['magnitude'].values.astype(np.float64),
-            self.theta, self.mc,
+            mags, self.theta, self.mc, kappas=kappas,
         )
 
     # ------------------------------------------------------------------
@@ -355,12 +506,12 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
         import datetime
         from etas.intensity import _compute_time_decay
 
-        mu = 10 ** self.theta['log10_mu']
+        mu = self._bg_field if self._bg_field is not None else 10 ** self.theta['log10_mu']
 
         n_app = len(self._appended)
         if n_app > self._n_app_built:
             new_chunk = self._precompute_spatial_weights(
-                self._appended.iloc[self._n_app_built:])
+                self._appended.iloc[self._n_app_built:], use_kappa=False)
             self._w_appended  = np.hstack([self._w_appended, new_chunk])
             self._n_app_built = n_app
 
@@ -377,9 +528,10 @@ class EtasPriorUpdater(TimeDependentPriorUpdater):
             td          = _compute_time_decay(
                               self._hist_times[hist_mask], forecast_time, self.theta)
             lambda_vals = (mu + (self._w_hist[:, hist_mask.values] * td).sum(axis=1))
-        # Else background seismicity rate (mu)
+        # Else background seismicity rate (mu, scalar or spatially-varying field)
         else:
-            lambda_vals = np.full(len(self.grid_lats_masked), mu)
+            lambda_vals = (np.full(len(self.grid_lats_masked), mu)
+                          if np.isscalar(mu) else mu.copy())
 
         # --- Appended-events contribution (weights built once per append) ---
         # This repeats the same logic as above, but for the appended events.
